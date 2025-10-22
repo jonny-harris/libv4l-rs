@@ -7,9 +7,11 @@ use libc;
 
 use crate::capability::Capabilities;
 use crate::control::{self, Control, Description};
+use crate::format::*;
 use crate::v4l2;
 use crate::v4l2::videodev::v4l2_ext_controls;
 use crate::v4l_sys::*;
+
 
 /// Linux capture device abstraction
 pub struct Device {
@@ -167,6 +169,91 @@ impl Device {
         Ok(controls)
     }
 
+    pub fn query_formats(&self) -> io::Result<Vec<Format>> {
+        let mut formats = Vec::new();
+        unsafe {
+            let mut v4l2_fmt: v4l2_fmtdesc = mem::zeroed();
+            v4l2_fmt.index = 0;
+            v4l2_fmt.type_ = 1;
+
+            loop {
+                let res = v4l2::ioctl(
+                    self.handle().fd(),
+                    v4l2::vidioc::VIDIOC_ENUM_FMT,
+                    &mut v4l2_fmt as *mut _ as *mut std::os::raw::c_void,
+                );
+
+                if let Err(e) = res {
+                    if e.kind() == io::ErrorKind::InvalidInput {
+                        break; // no more formats
+                    } else {
+                        return Err(e);
+                    }
+                }
+
+                // Enumerate frame sizes for this pixel format
+                let mut frame_sizes = Vec::new();
+                let mut v4l2_fs: v4l2_frmsizeenum = mem::zeroed();
+                v4l2_fs.pixel_format = v4l2_fmt.pixelformat;
+                v4l2_fs.index = 0;
+
+                loop {
+                    let res = v4l2::ioctl(
+                        self.handle().fd(),
+                        v4l2::vidioc::VIDIOC_ENUM_FRAMESIZES,
+                        &mut v4l2_fs as *mut _ as *mut std::os::raw::c_void,
+                    );
+
+                    if let Err(e) = res {
+                        if e.kind() == io::ErrorKind::InvalidInput {
+                            break; // no more sizes
+                        } else {
+                            return Err(e);
+                        }
+                    }
+
+                    match v4l2_fs.type_ {
+                        V4L2_FRMSIZE_TYPE_DISCRETE => {
+                            let width = unsafe { v4l2_fs.__bindgen_anon_1.discrete.width };
+                            let height = unsafe { v4l2_fs.__bindgen_anon_1.discrete.height };
+                            frame_sizes.push((width, height));
+                        }
+                        V4L2_FRMSIZE_TYPE_STEPWISE => {
+                            let min_w = unsafe { v4l2_fs.__bindgen_anon_1.stepwise.min_width };
+                            let min_h = unsafe { v4l2_fs.__bindgen_anon_1.stepwise.min_height };
+                            let max_w = unsafe { v4l2_fs.__bindgen_anon_1.stepwise.max_width };
+                            let max_h = unsafe { v4l2_fs.__bindgen_anon_1.stepwise.max_height };
+
+                            frame_sizes.push((min_w, min_h));
+                            frame_sizes.push((max_w, max_h));
+                        }
+                        _ => {}
+                    }
+
+                    v4l2_fs.index += 1;
+                }
+
+                for (width, height) in frame_sizes {
+                    formats.push(Format {
+                        width,
+                        height,
+                        fourcc: v4l2_fmt.pixelformat.into(),
+                        field_order: FieldOrder::Any,     
+                        stride: 0,
+                        size: 0,
+                        flags: Flags::empty(),
+                        colorspace: Colorspace::Default,
+                        quantization: Quantization::Default,
+                        transfer: TransferFunction::Default,
+                    });
+                }
+
+                v4l2_fmt.index += 1;
+            }
+        }
+
+        Ok(formats)
+    }
     /// Returns the current control value from its [`Description`]
     ///
     /// # Arguments
