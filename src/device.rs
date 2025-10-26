@@ -8,6 +8,7 @@ use libc;
 use crate::capability::Capabilities;
 use crate::control::{self, Control, Description};
 use crate::format::*;
+use crate::buffer::Type;
 use crate::v4l2;
 use crate::v4l2::videodev::v4l2_ext_controls;
 use crate::v4l_sys::*;
@@ -91,82 +92,6 @@ impl Device {
 
             Ok(Capabilities::from(v4l2_caps))
         }
-    }
-
-    /// Returns the supported controls for a device such as gain, focus, white balance, etc.
-    pub fn query_controls(&self) -> io::Result<Vec<Description>> {
-        let mut controls = Vec::new();
-        unsafe {
-            let mut v4l2_ctrl: v4l2_query_ext_ctrl = mem::zeroed();
-
-            loop {
-                v4l2_ctrl.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
-                v4l2_ctrl.id |= V4L2_CTRL_FLAG_NEXT_COMPOUND;
-                match v4l2::ioctl(
-                    self.handle().fd(),
-                    v4l2::vidioc::VIDIOC_QUERY_EXT_CTRL,
-                    &mut v4l2_ctrl as *mut _ as *mut std::os::raw::c_void,
-                ) {
-                    Ok(_) => {
-                        // get the basic control information
-                        let mut control = Description::from(v4l2_ctrl);
-
-                        // if this is a menu control, enumerate its items
-                        if control.typ == control::Type::Menu
-                            || control.typ == control::Type::IntegerMenu
-                        {
-                            let mut items = Vec::new();
-
-                            for i in (v4l2_ctrl.minimum..=v4l2_ctrl.maximum)
-                                .step_by(v4l2_ctrl.step as usize)
-                            {
-                                let mut v4l2_menu = v4l2_querymenu {
-                                    id: v4l2_ctrl.id,
-                                    index: i as u32,
-                                    ..mem::zeroed()
-                                };
-                                let res = v4l2::ioctl(
-                                    self.handle().fd(),
-                                    v4l2::vidioc::VIDIOC_QUERYMENU,
-                                    &mut v4l2_menu as *mut _ as *mut std::os::raw::c_void,
-                                );
-
-                                // BEWARE OF DRAGONS!
-                                // The API docs [1] state VIDIOC_QUERYMENU should may return EINVAL
-                                // for some indices between minimum and maximum when an item is not
-                                // supported by a driver.
-                                //
-                                // I have no idea why it is advertised in the first place then, but
-                                // have seen this happen with a Logitech C920 HD Pro webcam.
-                                // In case of errors, let's just skip the offending index.
-                                //
-                                // [1] https://github.com/torvalds/linux/blob/master/Documentation/userspace-api/media/v4l/vidioc-queryctrl.rst#description
-                                if res.is_err() {
-                                    continue;
-                                }
-
-                                let item =
-                                    control::MenuItem::try_from((control.typ, v4l2_menu)).unwrap();
-                                items.push((v4l2_menu.index, item));
-                            }
-
-                            control.items = Some(items);
-                        }
-
-                        controls.push(control);
-                    }
-                    Err(e) => {
-                        if controls.is_empty() || e.kind() != io::ErrorKind::InvalidInput {
-                            return Err(e);
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(controls)
     }
 
     pub fn query_formats(&self) -> io::Result<Vec<Format>> {
@@ -253,6 +178,143 @@ impl Device {
         }
 
         Ok(formats)
+    }
+
+    /// Returns the current video format
+    pub fn format(&self) -> io::Result<Format> {
+        unsafe {
+            let mut v4l2_fmt: v4l2_format = mem::zeroed();
+            v4l2_fmt.type_ = Type::VideoCapture as u32;
+
+            v4l2::ioctl(
+                self.handle().fd(),
+                v4l2::vidioc::VIDIOC_G_FMT,
+                &mut v4l2_fmt as *mut _ as *mut std::os::raw::c_void,
+            )?;
+
+            let fmt = v4l2_fmt.fmt.pix;
+            Ok(Format {
+                width: fmt.width,
+                height: fmt.height,
+                fourcc: fmt.pixelformat.into(),
+                field_order: FieldOrder::Any,
+                stride: fmt.bytesperline,
+                size: fmt.sizeimage,
+                flags: Flags::empty(),
+                colorspace: Colorspace::Default,
+                quantization: Quantization::Default,
+                transfer: TransferFunction::Default,
+            })
+        }
+    }
+
+    /// Sets the video format
+    pub fn set_format(&self, format: &Format) -> io::Result<Format> {
+        unsafe {
+            let mut v4l2_fmt: v4l2_format = mem::zeroed();
+            v4l2_fmt.type_ = Type::VideoCapture as u32;
+
+            v4l2_fmt.fmt.pix.width = format.width;
+            v4l2_fmt.fmt.pix.height = format.height;
+            v4l2_fmt.fmt.pix.pixelformat = format.fourcc.into();
+            v4l2_fmt.fmt.pix.field = FieldOrder::Any as u32;
+
+            v4l2::ioctl(
+                self.handle().fd(),
+                v4l2::vidioc::VIDIOC_S_FMT,
+                &mut v4l2_fmt as *mut _ as *mut std::os::raw::c_void,
+            )?;
+
+            let fmt = v4l2_fmt.fmt.pix;
+            Ok(Format {
+                width: fmt.width,
+                height: fmt.height,
+                fourcc: fmt.pixelformat.into(),
+                field_order: FieldOrder::Any,
+                stride: fmt.bytesperline,
+                size: fmt.sizeimage,
+                flags: Flags::empty(),
+                colorspace: Colorspace::Default,
+                quantization: Quantization::Default,
+                transfer: TransferFunction::Default,
+            })
+        }
+    }
+
+    /// Returns the supported controls for a device such as gain, focus, white balance, etc.
+    pub fn query_controls(&self) -> io::Result<Vec<Description>> {
+        let mut controls = Vec::new();
+        unsafe {
+            let mut v4l2_ctrl: v4l2_query_ext_ctrl = mem::zeroed();
+
+            loop {
+                v4l2_ctrl.id |= V4L2_CTRL_FLAG_NEXT_CTRL;
+                v4l2_ctrl.id |= V4L2_CTRL_FLAG_NEXT_COMPOUND;
+                match v4l2::ioctl(
+                    self.handle().fd(),
+                    v4l2::vidioc::VIDIOC_QUERY_EXT_CTRL,
+                    &mut v4l2_ctrl as *mut _ as *mut std::os::raw::c_void,
+                ) {
+                    Ok(_) => {
+                        // get the basic control information
+                        let mut control = Description::from(v4l2_ctrl);
+
+                        // if this is a menu control, enumerate its items
+                        if control.typ == control::Type::Menu
+                            || control.typ == control::Type::IntegerMenu
+                        {
+                            let mut items = Vec::new();
+
+                            for i in (v4l2_ctrl.minimum..=v4l2_ctrl.maximum)
+                                .step_by(v4l2_ctrl.step as usize)
+                            {
+                                let mut v4l2_menu = v4l2_querymenu {
+                                    id: v4l2_ctrl.id,
+                                    index: i as u32,
+                                    ..mem::zeroed()
+                                };
+                                let res = v4l2::ioctl(
+                                    self.handle().fd(),
+                                    v4l2::vidioc::VIDIOC_QUERYMENU,
+                                    &mut v4l2_menu as *mut _ as *mut std::os::raw::c_void,
+                                );
+
+                                // BEWARE OF DRAGONS!
+                                // The API docs [1] state VIDIOC_QUERYMENU should may return EINVAL
+                                // for some indices between minimum and maximum when an item is not
+                                // supported by a driver.
+                                //
+                                // I have no idea why it is advertised in the first place then, but
+                                // have seen this happen with a Logitech C920 HD Pro webcam.
+                                // In case of errors, let's just skip the offending index.
+                                //
+                                // [1] https://github.com/torvalds/linux/blob/master/Documentation/userspace-api/media/v4l/vidioc-queryctrl.rst#description
+                                if res.is_err() {
+                                    continue;
+                                }
+
+                                let item =
+                                    control::MenuItem::try_from((control.typ, v4l2_menu)).unwrap();
+                                items.push((v4l2_menu.index, item));
+                            }
+
+                            control.items = Some(items);
+                        }
+
+                        controls.push(control);
+                    }
+                    Err(e) => {
+                        if controls.is_empty() || e.kind() != io::ErrorKind::InvalidInput {
+                            return Err(e);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(controls)
     }
     /// Returns the current control value from its [`Description`]
     ///
